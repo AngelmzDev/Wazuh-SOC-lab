@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/branding/logo.svg" alt="Logo de Wazuh-SOC-lab" width="128" height="128">
+</p>
+
 # 🛡️ Proyecto: Wazuh SOC Lab (All-in-One)
 
 ## 👤 Implementado por: zerozeid
