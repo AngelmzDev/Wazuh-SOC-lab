@@ -1,0 +1,9 @@
+# Credenciales y material criptográfico
+wazuh-install-files.tar
+wazuh-passwords*.txt
+*.key
+*.pem
+
+# Salidas locales
+*.log
+*.tmp

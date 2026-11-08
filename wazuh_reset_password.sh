@@ -1,186 +1,143 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-# =========================================================================
-# SCRIPT DE RESTABLECIMIENTO DE CONTRASEÑA DE WAZUH DASHBOARD (admin)
-# Creado para facilitar el proceso manual de cambio de credenciales de OpenSearch.
-# =========================================================================
+readonly DEFAULT_PASSWORD_TOOL="/usr/share/wazuh-indexer/plugins/opensearch-security/tools/wazuh-passwords-tool.sh"
+readonly SERVICES=(wazuh-indexer filebeat wazuh-manager wazuh-dashboard)
 
-# -------------------------------------------------------------------------
-# 1. CONFIGURACIÓN Y RUTAS CLAVE
-# -------------------------------------------------------------------------
-
-# Rutas comunes para los scripts de seguridad de OpenSearch/Wazuh Indexer
-# El script buscará la primera ruta válida.
-PATHS_TO_SEARCH=(
-    "/usr/share/wazuh-indexer/plugins/opensearch-security/tools"
-    "/usr/share/opensearch/plugins/opensearch-security/tools"
-)
-
-# Ruta del archivo de configuración de usuarios internos
-INTERNAL_USERS_YML="/etc/opensearch/opensearch-security/internal_users.yml"
-
-# Nombre del usuario a modificar (Generalmente 'admin')
+ACTION=""
 TARGET_USER="admin"
+RESTART_SERVICES=false
+PASSWORD_TOOL="${WAZUH_PASSWORD_TOOL:-$DEFAULT_PASSWORD_TOOL}"
+SYSTEMCTL="${WAZUH_SYSTEMCTL:-systemctl}"
 
-# Variables para almacenar rutas encontradas
-HASH_SCRIPT=""
-ADMIN_SCRIPT=""
-SECURITY_DIR=""
+usage() {
+  cat <<'EOF'
+Uso:
+  sudo ./wazuh_reset_password.sh --check
+  sudo ./wazuh_reset_password.sh --generate [--user USUARIO] [--restart]
 
+Acciones:
+  --check       Comprueba la herramienta oficial y el estado de los servicios.
+  --generate    Genera y aplica una contraseña aleatoria mediante Wazuh.
 
-# -------------------------------------------------------------------------
-# 2. FUNCIONES
-# -------------------------------------------------------------------------
+Opciones:
+  --user NAME   Usuario interno del indexer (por defecto: admin).
+  --restart     Reinicia y verifica Filebeat, Manager y Dashboard después.
+  -h, --help    Muestra esta ayuda.
 
-# Función para imprimir mensajes de error y salir
-exit_on_error() {
-    echo -e "\n\033[0;31m❌ ERROR: $1\033[0m"
-    exit 1
+Esta utilidad está destinada a instalaciones Wazuh All-in-One por paquetes.
+No edita internal_users.yml ni ejecuta securityadmin.sh directamente.
+EOF
 }
 
-# Función para encontrar los scripts y verificar la configuración
-find_scripts() {
-    echo -e "🔎 Buscando scripts de seguridad de OpenSearch..."
-    for dir in "${PATHS_TO_SEARCH[@]}"; do
-        if [ -d "$dir" ]; then
-            if [ -x "$dir/hash.sh" ] && [ -x "$dir/securityadmin.sh" ]; then
-                HASH_SCRIPT="$dir/hash.sh"
-                ADMIN_SCRIPT="$dir/securityadmin.sh"
-                SECURITY_DIR="/etc/opensearch/opensearch-security/"
-                
-                # Intentar encontrar la ruta de los certificados
-                if [ ! -f "${SECURITY_DIR}/certs/root-ca.pem" ]; then
-                    # Si no encuentra la ruta típica, buscar en /etc/wazuh-indexer/
-                    SECURITY_DIR="/etc/wazuh-indexer/opensearch-security/"
-                fi
-
-                echo -e "✅ Scripts encontrados en: \033[0;32m$dir\033[0m"
-                return 0
-            fi
-        fi
-    done
-    exit_on_error "No se pudieron encontrar los scripts 'hash.sh' y 'securityadmin.sh' en las rutas comunes. Verifica la instalación de Wazuh Indexer."
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
 }
 
-# Función para generar el hash de la nueva contraseña
-generate_hash() {
-    echo -e "\n=========================================================="
-    echo -e "🔑 INGRESA LA NUEVA CONTRASEÑA para el usuario '$TARGET_USER'."
-    echo "=========================================================="
+parse_args() {
+  while (($#)); do
+    case "$1" in
+      --check|--generate)
+        [[ -z "$ACTION" ]] || die "Elige una sola acción."
+        ACTION="$1"
+        ;;
+      --user)
+        shift
+        (($#)) || die "Falta el valor de --user."
+        TARGET_USER="$1"
+        ;;
+      --restart)
+        RESTART_SERVICES=true
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Opción desconocida: $1. Usa --help."
+        ;;
+    esac
+    shift
+  done
 
-    # Lectura de la contraseña en modo silencioso (no visible)
-    read -s -p "Nueva Contraseña: " NEW_PASSWORD
-    echo "" # Salto de línea después de la entrada silenciosa
-
-    if [ -z "$NEW_PASSWORD" ]; then
-        exit_on_error "La contraseña no puede estar vacía. Abortando."
-    fi
-
-    echo "Generando hash..."
-    # Ejecuta el script hash.sh
-    HASH_OUTPUT=$("$HASH_SCRIPT" -p "$NEW_PASSWORD")
-
-    # Verifica si la generación del hash fue exitosa
-    if [ $? -ne 0 ]; then
-        exit_on_error "Fallo al generar el hash. Verifica que la contraseña no contenga caracteres inválidos o problemas de permisos."
-    fi
-
-    echo -e "\n✅ Hash generado: \033[0;33m$HASH_OUTPUT\033[0m"
-    
-    # Guardar el hash para usarlo globalmente
-    NEW_HASH="$HASH_OUTPUT"
+  [[ -n "$ACTION" ]] || die "Elige una acción: --check o --generate."
+  [[ "$TARGET_USER" =~ ^[A-Za-z0-9._-]+$ ]] ||
+    die "El nombre de usuario contiene caracteres no permitidos."
+  if [[ "$ACTION" == "--check" && "$RESTART_SERVICES" == true ]]; then
+    die "--restart solo se puede usar con --generate."
+  fi
 }
 
-# Función para inyectar el nuevo hash en el archivo de configuración
-update_yml() {
-    echo -e "\n⏳ Actualizando el archivo de configuración $INTERNAL_USERS_YML..."
-    
-    if [ ! -f "$INTERNAL_USERS_YML" ]; then
-        exit_on_error "Archivo $INTERNAL_USERS_YML no encontrado. Verifica la ruta o la instalación de OpenSearch."
-    fi
-
-    # Guardamos la configuración original como respaldo
-    sudo cp "$INTERNAL_USERS_YML" "$INTERNAL_USERS_YML.bak.$(date +%Y%m%d%H%M%S)"
-
-    # Utilizamos Perl para una sustitución multilínea más robusta:
-    # 1. Busca la línea que comienza con 'admin:'
-    # 2. Reemplaza la siguiente línea que contiene 'hash:' con el nuevo hash.
-    sudo perl -i -pe "s/(^  ${TARGET_USER}:\n\s+hash: ).*/\1${NEW_HASH}/m" "$INTERNAL_USERS_YML"
-
-    if [ $? -ne 0 ]; then
-         exit_on_error "Fallo al modificar $INTERNAL_USERS_YML con el nuevo hash. Revisa el archivo de respaldo."
-    fi
-
-    echo -e "✅ Hash actualizado correctamente en $INTERNAL_USERS_YML."
+require_root() {
+  if [[ "${WAZUH_TEST_MODE:-0}" != "1" && "$EUID" -ne 0 ]]; then
+    die "Ejecuta esta utilidad con sudo."
+  fi
 }
 
-# Función para aplicar la configuración de seguridad
-apply_security_config() {
-    echo -e "\n⏳ Aplicando la nueva configuración de seguridad con securityadmin.sh..."
-    
-    # Las rutas de los certificados son cruciales y a menudo están en /etc/opensearch/certs/ o /etc/wazuh-indexer/certs/
-    CERT_DIR=$(dirname "$SECURITY_DIR")/certs
-    
-    if [ ! -d "$CERT_DIR" ]; then
-        exit_on_error "Directorio de certificados no encontrado en $CERT_DIR. Las rutas pueden ser incorrectas."
-    fi
-
-    # Comando completo para aplicar los cambios de seguridad
-    sudo "$ADMIN_SCRIPT" -cd "$SECURITY_DIR" -nhnv \
-        -cacert "$CERT_DIR/root-ca.pem" \
-        -cert "$CERT_DIR/admin.pem" \
-        -key "$CERT_DIR/admin-key.pem"
-        
-    if [ $? -ne 0 ]; then
-        exit_on_error "Fallo al ejecutar securityadmin.sh. Verifica las rutas de los certificados o si OpenSearch está en funcionamiento."
-    fi
-    
-    echo -e "✅ Configuración de seguridad aplicada exitosamente."
+require_password_tool() {
+  [[ -f "$PASSWORD_TOOL" ]] ||
+    die "No se encontró wazuh-passwords-tool.sh en $PASSWORD_TOOL. Comprueba que este nodo aloja Wazuh Indexer."
 }
 
-# Función para reiniciar los servicios
-restart_services() {
-    echo -e "\n⏳ Reiniciando servicios de Wazuh Indexer y Dashboard para aplicar el cambio..."
-    
-    # Reiniciar Indexer
-    sudo systemctl restart wazuh-indexer || sudo systemctl restart opensearch
-    
-    # Reiniciar Dashboard
-    sudo systemctl restart wazuh-dashboard || sudo systemctl restart kibana
-    
-    echo -e "✅ Servicios reiniciados."
+service_status() {
+  local service="$1"
+  "$SYSTEMCTL" is-active "$service"
 }
 
+check_environment() {
+  local failed=0
+  require_password_tool
+  printf 'Herramienta oficial: %s\n' "$PASSWORD_TOOL"
+  printf 'Servicios All-in-One:\n'
+  for service in "${SERVICES[@]}"; do
+    if service_status "$service"; then
+      printf '  [OK] %s\n' "$service"
+    else
+      printf '  [FALLO] %s\n' "$service"
+      failed=1
+    fi
+  done
+  return "$failed"
+}
 
-# -------------------------------------------------------------------------
-# 3. EJECUCIÓN PRINCIPAL
-# -------------------------------------------------------------------------
+generate_password() {
+  require_password_tool
+  printf 'Cambiando la contraseña de %s con la herramienta oficial de Wazuh...\n' "$TARGET_USER"
+  bash "$PASSWORD_TOOL" -u "$TARGET_USER"
+  printf '\nGuarda la contraseña mostrada en un gestor de secretos antes de cerrar esta terminal.\n'
+}
 
-echo "=========================================================="
-echo "         Wazuh Dashboard Password Reset Tool"
-echo "=========================================================="
+restart_and_verify() {
+  local service
+  for service in filebeat wazuh-manager wazuh-dashboard; do
+    printf 'Reiniciando %s...\n' "$service"
+    "$SYSTEMCTL" restart "$service"
+  done
+  for service in filebeat wazuh-manager wazuh-dashboard; do
+    service_status "$service" ||
+      die "El servicio $service no está activo después del reinicio."
+  done
+  printf 'Servicios reiniciados y activos.\n'
+}
 
-# 1. Verificar si se está ejecutando como root
-if [ "$EUID" -ne 0 ]; then
-    exit_on_error "Este script debe ejecutarse con 'sudo'. Por favor, inténtalo de nuevo con: sudo ./wazuh_reset_password.sh"
-fi
+main() {
+  parse_args "$@"
+  require_root
 
-# 2. Encontrar rutas
-find_scripts
+  case "$ACTION" in
+    --check)
+      check_environment
+      ;;
+    --generate)
+      generate_password
+      if [[ "$RESTART_SERVICES" == true ]]; then
+        restart_and_verify
+      else
+        printf 'No se reiniciaron servicios. Usa --restart si tu mantenimiento lo requiere.\n'
+      fi
+      ;;
+  esac
+}
 
-# 3. Generar nuevo hash
-generate_hash
-
-# 4. Inyectar hash en YML (se hace con sudo dentro de la función)
-update_yml
-
-# 5. Aplicar la nueva configuración de seguridad (se hace con sudo)
-apply_security_config
-
-# 6. Reiniciar servicios (se hace con sudo)
-restart_services
-
-echo -e "\n\033[0;32m🎉 ¡PROCESO TERMINADO! 🎉\033[0m"
-echo "La contraseña del usuario '$TARGET_USER' ha sido restablecida."
-echo "Ahora puedes iniciar sesión en el Dashboard de Wazuh."
-echo "=========================================================="
+main "$@"
